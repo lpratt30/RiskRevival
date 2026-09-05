@@ -1,298 +1,296 @@
-from env import RiskEnvFlat, DQNAgent
+"""Train/evaluate the Risk Double DQN agent from a YAML configuration."""
 
-from pathlib import Path
-import matplotlib.pyplot as plt
-import gym
-import numpy as np
-import pandas as pd
+import argparse
+import json
 import random
-
 import time
-import yaml
-import os
-import statistics
-import shutil
+from pathlib import Path
 
-######################################### Main Notes #########################################
-# This .py controls the training process by using the parameters defined in training_config.yaml 
-# It is the main .py which depends upon all other core .py's. It should run and produce results 
-# in the dir experiment_results; if you're new to this codebase you should be here running this
-#
-# Structurally, the Agent is defined in the env.py and then is initialized here
-# It may arguably make more sense for the Agent to instead be defined here, because the Agent's 
-# optimize method is a core part of the training process. However, Agent is also part of Risk
-# environment! 
-##############################################################################################
+import numpy as np
+import torch
+import yaml
+
+from dqn import DQNAgent
+from env import RiskEnvFlat
+from reporting import create_output_graphs
+
+DEFAULT_CONFIG = Path(__file__).with_name("training_config.yaml")
+
+
+def load_config(path):
+    with Path(path).open(encoding="utf-8") as stream:
+        config = yaml.safe_load(stream)
+    if not isinstance(config, dict):
+        raise ValueError("Training configuration must be a mapping")
+    for key in (
+        "num_episodes",
+        "max_actions",
+        "save_interval",
+        "batch_size",
+        "optimize_ratio",
+        "target_update_freq",
+        "num_eval",
+    ):
+        value = config.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{key} must be a positive integer")
+    if config.get("decay_type") not in ("lin", "geo", "osc"):
+        raise ValueError("decay_type must be lin, geo, or osc")
+    if not 0 <= config["epsilon_min"] <= config["epsilon_max"] <= 1:
+        raise ValueError("Require 0 <= epsilon_min <= epsilon_max <= 1")
+    name = config.get("experiment_name")
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+    ):
+        raise ValueError("experiment_name must be a single directory name")
+    return config
+
+
+def episode_result(env):
+    if env.agent.territory_count == len(env.territories):
+        return "win"
+    if env.agent.territory_count == 0:
+        return "lose"
+    return "draw"
 
 
 def evaluate(agent, env, max_actions=500, num_eval=1, show_board=False):
-    for i in range(num_eval):
-        agent.epsilon = 0
+    """Greedy evaluation does not change the agent's exploration rate."""
+    if max_actions < 1 or num_eval < 1:
+        raise ValueError("Evaluation counts must be positive")
+    results = []
+    for _ in range(num_eval):
         state, _ = env.reset()
-        actions = 0
         total_reward = 0
         illegal_moves = 0
-        terminated = False
-        np.set_printoptions(precision=2)
-        while not terminated and actions < max_actions:
-            action = agent.act(state)
-
+        for actions in range(1, max_actions + 1):
+            action = agent.act(state, eval=True)
             if show_board:
-                if env.phase in (0, 1, 3):
-                    env.show_board()
-                print(state, action)
-
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            state = next_state
-            actions += 1
+                env.show_board()
+            state, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
-            if reward == env.invalid_move_penalty:
-                illegal_moves += 1
-        opponents_alive = 0
-        for p in env.players[1:]:
-            if p.territory_count > 0:
-                opponents_alive += 1
-        result = None
-        if opponents_alive == 0: result  = "win"
-        elif env.agent.territory_count == 0: result = "lose"
-        else: result = "draw"
-        print(f"Evaluation Reward: {(total_reward):.3f}, Illegal Move Ratio: {illegal_moves/actions:.3f} Result: {result}")
+            illegal_moves += int(info["illegal_action"])
+            if terminated or truncated:
+                break
+        result = dict(
+            reward=total_reward,
+            actions=actions,
+            illegal_move_ratio=illegal_moves / actions,
+            result=episode_result(env),
+        )
+        results.append(result)
+        print(
+            f"Evaluation reward: {total_reward:.3f}; illegal moves: "
+            f"{result['illegal_move_ratio']:.3f}; result: {result['result']}"
+        )
+    return results
 
 
+def exploration_rate(config, episode):
+    start, end = config["epsilon_max"], config["epsilon_min"]
+    progress = (episode + 1) / config["num_episodes"]
+    if config["decay_type"] == "lin":
+        return max(end, start - progress * (start - end))
+    amplitude = (1 - progress) * (start - end)
+    phase = episode / config["num_episodes"] * config["num_oscillations"] * 2 * np.pi
+    return float(np.clip(end + amplitude * abs(np.sin(phase)), end, start))
 
-def create_output_graphs(output_dir, num_episodes, num_players, bot_types, size, output_lists):
-    sizes = ["Small", "Medium", "Large"]
-    bots = ', '.join(set(bot_types))
-    output_path = Path(f'{output_dir}/outputs')
-    output_path.mkdir(parents=True, exist_ok=True)
-    names = ["Average Reward", "Cumulative Reward", "Loss", "Illegal Move Ratio", "Number of Actions", "Number of Turns", "Episode Time", "Action Selection STD", "Skip Action Ratio", "Percentage Map Owned on End"]
 
-    # Determine the layout of the subplots
-    num_graphs = len(output_lists)
-    num_cols = 5
-    num_rows = (num_graphs + num_cols - 1) // num_cols  # Ensure enough rows for all graphs
-    fig, axes = plt.subplots(nrows=num_rows, ncols=num_cols, figsize=(36, 6 * num_rows))  # Adjust size accordingly
-    axes = axes.flatten()  # Flatten the 2D array of axes to easily iterate over it
+def train_episode(agent, env, max_actions, optimize_ratio):
+    state, _ = env.reset()
+    counts = np.zeros(env.action_space.n, dtype=int)
+    rewards, losses = [], []
+    illegal_moves = 0
+    started = time.perf_counter()
+    for actions in range(1, max_actions + 1):
+        action = agent.act(state)
+        counts[action] += 1
+        next_state, reward, terminated, truncated, info = env.step(action)
+        truncated = bool(truncated or (actions == max_actions and not terminated))
+        agent.remember(state, action, reward, next_state, terminated, truncated)
+        state = next_state
+        rewards.append(reward)
+        illegal_moves += int(info["illegal_action"])
+        if actions % agent.batch_size == 0:
+            for _ in range(optimize_ratio):
+                loss = agent.optimize_network()
+                if loss is not None:
+                    losses.append(loss)
+        if terminated or truncated:
+            break
+    return {
+        "average_reward": float(np.mean(rewards)),
+        "cumulative_reward": float(sum(rewards)),
+        "loss": float(np.mean(losses)) if losses else 0.0,
+        "illegal_move_ratio": illegal_moves / actions,
+        "actions": actions,
+        "turns": env.turns_passed + 1,
+        "seconds": time.perf_counter() - started,
+        "action_std": float(np.std(counts)),
+        "skip_ratio": float(counts[-1] / actions),
+        "map_owned": env.agent.territory_count / len(env.territories),
+        "result": episode_result(env),
+        "truncated": truncated,
+    }
 
-    for ax, output, name in zip(axes, output_lists, names):
-        # Calculate the rolling average with a window of 30
-        data_series = pd.Series(output)
-        rolling_avg = data_series.rolling(window=30).mean()
 
-        # Plot the original data and rolling average on each subplot
-        ax.plot(range(1, num_episodes+1), output, label='Original')
-        ax.plot(range(1, num_episodes+1), rolling_avg, label='Rolling Average', color='orange')
-        ax.set_xlabel("Episode")
-        ax.set_ylabel(name)
-        ax.set_title(f"{name} - {sizes[size]} Board; {num_players} Players; {bots}")
-        ax.legend()
-
-    # Turn off any extra empty subplots
-    for i in range(num_graphs, num_rows * num_cols):
-        fig.delaxes(axes[i])
-
-    plt.tight_layout()
-    # Save the entire figure with all subplots
-    plt.savefig(output_path / f"combined_{sizes[size].lower()}_{num_players}_{'_'.join(set(bot_types)).lower()}.png")
-    plt.close(fig)
-
-    # in addition to the large graph which is easier viewing for monitoring,
-    # create all the smaller graphs which can be better for reporting
-    def create_graph(output, name):
-        data_series = pd.Series(output)
-        rolling_avg = data_series.rolling(window=30).mean()
-
-        # plt.plot(range(1, num_episodes+1), output)
-        plt.plot(range(1, num_episodes+1), output, label='Original')
-        plt.plot(range(1, num_episodes+1), rolling_avg, label='Rolling Average', color='orange')
-        plt.xlabel("Episode")
-        plt.ylabel(name)
-        plt.title(f"{name} - {sizes[size]} Board; {num_players} Players; {bots} Bots")
-        plt.savefig(output_path / f"{sizes[size].lower()}_{num_players}_{'_'.join(set(bot_types)).lower()}_{name.lower().replace(' ', '_')}.png")
-        plt.clf()
-
-    for out, name in zip(output_lists, names):
-        create_graph(out, name)
-
-def create_bar_graphs(output_dir, num_episodes, num_players, bot_types, size, output_lists):
-    # use for composition analysis
-    # such as, STD of moves on a phasic basis, or illegal move ratio on phasic basis
-    return
-
-def main(env_name, num_episodes=2000, save_interval=100, load_model=False):
-    with open('training_config.yaml', 'r') as file:
-        config = yaml.safe_load(file)
-
-    os.system('cls') # assuming windows, clear debug output
-
-    num_episodes = config["num_episodes"]
-    save_interval = config["save_interval"]
-
-    num_players = config["num_players"]
-    bot_types = config["bot_types"]
-    size = config["size"]
-    env = gym.make(env_name, env_config={"num_players": num_players, "size": size, "bot_types": bot_types})
-
-    decay_type = config["decay_type"]
-    state_size = env.observation_space.shape[0]
-    action_size = env.action_space.n
-
-    output_dir = "experiment_results/" + config["experiment_name"]
-    checkpoint_path = Path(f'{output_dir}/checkpoints')
-    checkpoint_path.mkdir(parents=True, exist_ok=True)
-
-    shutil.copyfile('training_config.yaml', f"{output_dir}/config.yaml")
-
-    #start making 10% random moves, decay to .05%, with 10% soft update
-    #note that when the majority of moves are illegal, this is a high epsilon
-    #an idea is to have a legality weighted epsilon but aint nobody got time for that
-    #
-    #execution slows down dramatically with lower epsilons, I think its because the Agent
-    #is dumb and just makes illegal moves over and over
+def main(
+    env_name="RiskEnvFlat-v0",
+    num_episodes=None,
+    save_interval=None,
+    load_model=False,
+    *,
+    config_path=DEFAULT_CONFIG,
+    output_dir=None,
+    on_episode=None,
+):
+    """Shared training entry point; env_name is retained for old callers."""
+    if env_name != "RiskEnvFlat-v0":
+        raise ValueError("Only RiskEnvFlat-v0 is supported")
+    config = load_config(config_path)
+    for key, value in (
+        ("num_episodes", num_episodes),
+        ("save_interval", save_interval),
+    ):
+        if value is not None:
+            if not isinstance(value, int) or value < 1:
+                raise ValueError(f"{key} must be positive")
+            config[key] = value
+    seed = config.get("seed")
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+    env = RiskEnvFlat(config)
+    env.reset(seed=seed)
     agent = DQNAgent(
-        state_size,
-        action_size,
+        env.observation_space.shape[0],
+        env.action_space.n,
         batch_size=config["batch_size"],
         gamma=config["gamma"],
         epsilon=config["epsilon_max"],
         epsilon_min=config["epsilon_min"],
-        epsilon_decay=config["epsilon_decay"] if decay_type == "geo" else None,
+        epsilon_decay=config["epsilon_decay"]
+        if config["decay_type"] == "geo"
+        else None,
         learning_rate=config["learning_rate"],
         tau=config["tau"],
         num_layers=config["num_layers"],
         hidden_dim_max=config["hidden_dim_max"],
         hidden_dim_min=config["hidden_dim_min"],
-        target_update_freq=config["target_update_freq"]
+        target_update_freq=config["target_update_freq"],
+    )
+    output = (
+        Path(output_dir)
+        if output_dir is not None
+        else (Path(__file__).parent / "experiment_results" / config["experiment_name"])
+    )
+    checkpoints = output / "checkpoints"
+    eval_only = config.get("eval_only", False)
+    if (
+        not eval_only
+        and not load_model
+        and checkpoints.exists()
+        and any(checkpoints.iterdir())
+        and not config.get("overwrite", False)
+    ):
+        raise FileExistsError(
+            f"{checkpoints} already contains a run; choose a new experiment name "
+            "or set overwrite: true explicitly"
+        )
+    checkpoint = checkpoints / config.get("load_checkpoint", "dqn_model_best.pth")
+    if load_model or eval_only:
+        agent.load(checkpoint)
+    records = []
+    evaluations = []
+    try:
+        if not eval_only:
+            checkpoints.mkdir(parents=True, exist_ok=True)
+            (output / "config.yaml").write_text(
+                yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+            )
+            best_reward = -np.inf
+            for episode in range(config["num_episodes"]):
+                if config["decay_type"] != "geo":
+                    agent.epsilon = exploration_rate(config, episode)
+                record = train_episode(
+                    agent, env, config["max_actions"], config["optimize_ratio"]
+                )
+                records.append(record)
+                if (episode + 1) % config["save_interval"] == 0:
+                    agent.save(checkpoints / f"dqn_model_{episode}.pth")
+                if record["cumulative_reward"] > best_reward:
+                    best_reward = record["cumulative_reward"]
+                    agent.save(checkpoints / "dqn_model_best.pth")
+                print(
+                    f"Episode {episode + 1}/{config['num_episodes']}: "
+                    f"reward={record['cumulative_reward']:.2f}, loss={record['loss']:.5f}, "
+                    f"actions={record['actions']}, epsilon={agent.epsilon:.3f}"
+                )
+                if on_episode is not None:
+                    on_episode(episode + 1, record)
+            agent.save(checkpoints / "dqn_model_final.pth")
+            (output / "metrics.json").write_text(
+                json.dumps(records, indent=2), encoding="utf-8"
+            )
+            if config.get("save_plots", True):
+                keys = (
+                    "average_reward",
+                    "cumulative_reward",
+                    "loss",
+                    "illegal_move_ratio",
+                    "actions",
+                    "turns",
+                    "seconds",
+                    "action_std",
+                    "skip_ratio",
+                    "map_owned",
+                )
+                series = [[record[key] for record in records] for key in keys]
+                create_output_graphs(
+                    output,
+                    len(records),
+                    env.num_players,
+                    env.bot_types,
+                    env.board_size,
+                    series,
+                )
+        if eval_only or config.get("render_final_results", False):
+            if not eval_only:
+                agent.load(checkpoint)
+            evaluations = evaluate(
+                agent,
+                env,
+                config["max_actions"],
+                config["num_eval"],
+                config.get("show_board", False),
+            )
+            (output / "evaluation.json").write_text(
+                json.dumps(evaluations, indent=2), encoding="utf-8"
+            )
+        return {
+            "output_dir": str(output),
+            "episodes": records,
+            "evaluation": evaluations,
+        }
+    finally:
+        env.close()
+
+
+def cli():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--load-model", action="store_true")
+    args = parser.parse_args()
+    main(
+        config_path=args.config, output_dir=args.output_dir, load_model=args.load_model
     )
 
-    if load_model:
-        agent.load(checkpoint_path / 'dqn_model_best.pth')
-    print("I am using device", agent.device)
-
-    optimize_ratio = config["optimize_ratio"] #how much are we re-using old data
-    render = False
-    render_frequency = 200000 #out of
-    best_reward = -np.inf
-    avg_rewards, cum_rewards, losses, illegal_move_ratios, num_actions, num_turns, ep_time, action_stds, skip_action_ratios, map_ownership_ratios, phasic_action_stds = tuple([] for i in range(11))
-
-    num_oscillations = config["num_oscillations"]  # number of full oscillations over num_episodes
-    eps = eps_start = config["epsilon_max"]
-    eps_end = config["epsilon_min"]
-    max_actions = config["max_actions"]
-
-
-
-    if not config["eval_only"]:
-        # print(env.bot_types)
-        # env.show_board()
-        for episode in range(num_episodes):
-            if decay_type == "osc":
-                amplitude = eps_start - (episode / num_episodes) * (eps_start - eps_end)
-                phase = episode / num_episodes * num_oscillations * 2 * np.pi
-                eps = eps_end + amplitude * np.sin(phase)
-                eps = abs(eps)
-                agent.epsilon = eps
-            if decay_type == "lin":
-                eps -= (eps_start - eps_end) / num_episodes
-                agent.epsilon = eps
-            state, _ = env.reset()
-            terminated = False
-            total_reward = 0
-            actions = 0
-            illegal_moves = 0
-            loss = 0
-            loss_count = 0
-            skip_actions = 0
-            action_counts = {i: 0 for i in range(len(env.territories) + 1)}
-            #phase_action_counts = {i: {j: 0 for j in range(len(env.territories) + 1)} for i in range(5) # for composition analysis
-            phase_counts = {i: 0 for i in range(5)}
-            action_hist = []
-            skip_action = len(env.territories)
-
-            state_hist = [state]
-            start = time.time()
-
-            optim_time = 0
-
-
-            while not terminated:
-                action = agent.act(state)
-                if action == skip_action:
-                    skip_actions += 1
-                action_hist.append(action)
-                #phase_action_counts[env.phase][action] += 1
-                action_counts[action] += 1
-                phase_counts[env.phase] += 1
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                state_hist.append(next_state)
-                if reward == env.invalid_move_penalty:
-                    illegal_moves += 1
-                agent.remember(state, action, reward, next_state, terminated, truncated)
-                state = next_state
-                total_reward += reward
-                actions += 1 #why the flipping heck is this so high??
-                if render and random.randint(1, render_frequency) == render_frequency:
-                    env.show_board() #should prolly just save this or something, blocks are kinda annoying
-                start_optim = time.time()
-                if actions % agent.batch_size == 0:
-                    for i in range(optimize_ratio):
-                        loss += agent.optimize_network()
-                        loss_count += 1
-                optim_time += time.time() - start_optim
-
-
-                if actions == max_actions: #but why is this happening in the first place
-                    break
-            # Print to check if there's anything fishy
-            # if illegal_moves == 0 and actions < 10:
-            #     print(action_hist)
-            #     for s in state_hist:
-            #         print(s.tolist())
-
-            #if optimize_ratio > 1 and (episode + 1) % ((num_episodes/optimize_ratio)) == 0:
-            #    optimize_ratio -= 1 # recycle data less as the Agent advances
-            if (episode + 1) % save_interval == 0 or episode == 1:
-                agent.save(checkpoint_path / f'dqn_model_{episode}.pth')
-
-            if total_reward > best_reward and episode > save_interval:
-                best_reward = total_reward
-                agent.save(checkpoint_path / f'dqn_model_best_{episode}.pth')  # filename includes episode number
-                agent.save(checkpoint_path / f'dqn_model_best.pth')
-
-            ep_time.append(time.time() - start)
-            print(f"Episode {episode + 1}/{num_episodes}, Avg Reward: {(total_reward/actions):.4f}, Loss: {(loss/max(loss_count, 1)):.6f}, Epsilon: {agent.epsilon:.4f}, Illegal Move Ratio: {illegal_moves/actions:.3f} Actions: {actions}")
-            print(f"Turns passed {env.turns_passed}, Agent territories remaining {env.agent.territory_count}, Opponent territories remaining {len(env.territories) - env.agent.territory_count}")
-            action_std = np.std(list(action_counts.values()))
-            action_values = list(action_counts.values())
-            max_action_count = max(action_counts, key=action_counts.get)
-            print(f"Positive: {env.agent.positive_reward_only:.2f}, Negative: {env.agent.negative_reward_only:.2f}, Cumulative {env.agent.cumulative_reward:.2f}")
-            print(f"Min Action Count: {min(action_values)}, Median Action Count: {statistics.median(action_values)}, Action {max_action_count}, has the maximum count: {action_counts[max_action_count]}")
-            print(f"Placement Phase: {phase_counts[0]}, Attack Source: {phase_counts[1]}, Attack Target {phase_counts[2]}, Fortify From: {phase_counts[3]}, Fortify To: {phase_counts[4]}\n")
-            print(f"Total Time: {time.time() - start}, Optimization Time: {optim_time}\n")
-
-
-            avg_rewards.append(total_reward / actions)
-            cum_rewards.append(env.agent.cumulative_reward)
-            losses.append(loss/max(loss_count, 1))
-            illegal_move_ratios.append(illegal_moves/actions)
-            num_actions.append(actions)
-            num_turns.append(env.turns_passed + 1)
-            action_stds.append(action_std)
-            skip_action_ratios.append(skip_actions/actions)
-            map_ownership_ratios.append(env.agent.territory_count / len(env.territories))
-            #phasic_action_stds.append([np.std(actions) for actions in phase_action_counts_list])
-
-            assert(env.agent.territory_count <= len(env.territories))
-
-        out = (avg_rewards, cum_rewards, losses, illegal_move_ratios, num_actions, num_turns, ep_time, action_stds, skip_action_ratios, map_ownership_ratios)
-        create_output_graphs(output_dir, num_episodes, num_players, bot_types, size, out)
-
-    render_final_results = config["render_final_results"]
-    if render_final_results:
-        agent.load(checkpoint_path / config["load_checkpoint"])
-        evaluate(agent, env, config["max_actions"], config["num_eval"], config["show_board"])
-    env.close()
 
 if __name__ == "__main__":
-    gym.envs.register(id='RiskEnvFlat-v0', entry_point=RiskEnvFlat)
-    main('RiskEnvFlat-v0')
+    cli()
