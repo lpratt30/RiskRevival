@@ -1,0 +1,38 @@
+# Large research map (13 territories), one agent versus one Random bot.
+experiment_name: large_random_seed42
+seed: 42
+overwrite: false
+save_plots: true
+live_monitoring: true
+monitor_interval_seconds: 2
+
+num_episodes: 2000
+max_actions: 2000
+save_interval: 500
+
+num_players: 2
+size: 2
+bot_types:
+  - Random
+
+num_layers: 5
+hidden_dim_max: 512
+hidden_dim_min: 128
+batch_size: 64
+gamma: 0.95
+learning_rate: 0.005
+tau: 0.05
+optimize_ratio: 2
+target_update_freq: 100
+
+decay_type: lin
+epsilon_max: 1.0
+epsilon_min: 0.1
+epsilon_decay: 0.99997
+num_oscillations: 10
+
+render_final_results: true
+load_checkpoint: dqn_model_best.pth
+eval_only: false
+show_board: false
+num_eval: 20
