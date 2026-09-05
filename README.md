@@ -119,7 +119,10 @@ TensorBoard integration uses PyTorch's
   `Neutral`, `Random`, or YAML `null` for a passive manually controlled player.
   Neutral bots only reinforce. Random bots reinforce randomly, attack weaker
   neighbors up to three times (restarting after mandatory elimination trades),
-  then fortify.
+  then fortify. Border armies hold their position. An inland selected army moves
+  all but one troop along a friendly path to the strongest reachable border;
+  tied borders are selected by territory index. Declining an attack still allows
+  this fortification step.
 - Reinforcements deliberately use the project's aggressive rule:
   **3 + owned territories + continent bonuses**, rather than standard Risk.
 - Actions select a territory index or the skip index equal to the map size.

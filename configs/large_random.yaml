@@ -20,7 +20,7 @@ hidden_dim_max: 512
 hidden_dim_min: 128
 batch_size: 64
 gamma: 0.95
-learning_rate: 0.005
+learning_rate: 0.0003
 tau: 0.05
 optimize_ratio: 2
 target_update_freq: 100

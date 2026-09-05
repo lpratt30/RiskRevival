@@ -181,7 +181,16 @@ class ExperimentMonitor:
         temporary.write_text(
             json.dumps(self._state, indent=2, allow_nan=False), encoding="utf-8"
         )
-        os.replace(temporary, target)
+        # On Windows, a reader can briefly prevent replacement of an open file.
+        # Keep the last complete snapshot visible while retrying the atomic swap.
+        for attempt in range(5):
+            try:
+                os.replace(temporary, target)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.01)
 
     def _sample_loop(self):
         try:

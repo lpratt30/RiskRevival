@@ -93,3 +93,20 @@ not validated.
   overlapping step histories after evaluation, weight loading, or overwrites.
 - NVIDIA hardware queries time out after one second; unavailable GPU sensors
   are omitted. Both timeout behavior and multi-GPU parsing are covered by tests.
+- A Windows reader could briefly lock `status.json` during its atomic replacement,
+  stopping the sampling thread. Snapshot replacement now retries permission
+  errors up to five times with 10 ms between attempts; persistent errors still
+  surface instead of being hidden.
+
+## Random bot review follow-up
+
+- A declined attack returned `None` and overwrote the selected source, preventing
+  otherwise useful fortification. The source is now replaced only on conquest.
+- Fortifying into the strongest friendly neighbor could withdraw the invading
+  army from a newly conquered border. The bot now holds armies adjacent to an
+  enemy and moves inland armies to the strongest reachable friendly border,
+  using friendly paths and leaving one troop behind. No reachable border means
+  no fortification. This is a deliberate opponent-policy change.
+- The large-map Random-bot configuration now uses learning rate `0.0003`, down
+  from `0.005`. This is a conservative starting candidate, not an empirically
+  established optimum. Existing running processes must restart to use changes.

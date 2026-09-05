@@ -16,6 +16,33 @@ from train import DEFAULT_CONFIG, load_config, main
 
 
 class MonitoringUnitTests(unittest.TestCase):
+    def test_snapshot_retries_transient_windows_reader_lock(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = ExperimentMonitor(directory, self.config())
+            monitor.run_dir = Path(directory)
+            real_replace = os.replace
+            attempts = 0
+
+            def replace(source, target):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("file briefly open by reader")
+                real_replace(source, target)
+
+            with (
+                patch("monitoring.os.replace", side_effect=replace),
+                patch("monitoring.time.sleep"),
+            ):
+                monitor._write_snapshot()
+            self.assertEqual(attempts, 3)
+            self.assertEqual(
+                json.loads((Path(directory) / "status.json").read_text())["status"],
+                "running",
+            )
+
     def config(self):
         return {"experiment_name": "monitor-test", "num_episodes": 2, "max_actions": 5}
 

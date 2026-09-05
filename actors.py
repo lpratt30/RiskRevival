@@ -5,6 +5,7 @@ import random
 from atomic_actions import (
     attack_territory,
     fortify,
+    fortify_destinations,
     generate_troops,
     get_card,
     place_troops,
@@ -70,7 +71,7 @@ class Neutral_Bot(Player):
 
 
 class Random_Bot(Neutral_Bot):
-    """Reinforce randomly, attack weak neighbors up to three times, fortify."""
+    """Reinforce randomly, attack weak neighbors, then support enemy borders."""
 
     def __init__(self, color, turn_order, num_territories, num_players=None):
         super().__init__(color, turn_order, num_territories)
@@ -94,6 +95,24 @@ class Random_Bot(Neutral_Bot):
             return target
         return None
 
+    def _fortify(self, source):
+        """Hold border armies; move an inland army to a reachable friendly border."""
+        if source.troop_count < 2 or any(
+            neighbor.owner is not self for neighbor in source.neighbors
+        ):
+            return
+        borders = [
+            territory
+            for territory in fortify_destinations(source)
+            if any(neighbor.owner is not self for neighbor in territory.neighbors)
+        ]
+        if borders:
+            # Concentrate on the strongest reachable border, breaking ties by key.
+            target = max(
+                borders, key=lambda territory: (territory.troop_count, -territory.key)
+            )
+            fortify(source, target, source.troop_count - 1)
+
     def make_move(self, players, territories, verbose=False):
         if not self.territory_count:
             raise ValueError("An eliminated bot cannot move")
@@ -103,19 +122,16 @@ class Random_Bot(Neutral_Bot):
         attacks = 0
         won_card = False
         while attacks < attack_limit:
-            source = self._attack(source, verbose)
-            if source is None:
+            conquered = self._attack(source, verbose)
+            if conquered is None:
                 break
+            source = conquered
             attacks += 1
             won_card = True
             if self.hand.count >= 5:
                 self._place(territories, source, verbose)
                 attacks = 0
-        if source is not None and source.troop_count > 1:
-            friendly = [t for t in source.neighbors if t.owner is self]
-            if friendly:
-                target = max(friendly, key=lambda territory: territory.troop_count)
-                fortify(source, target, source.troop_count - 1)
+        self._fortify(source)
         if won_card:
             get_card(self.hand, self.rng)
         return True
