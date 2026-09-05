@@ -1,0 +1,5 @@
+-r requirements.txt
+psutil
+GPUtil
+wandb
+tensorboard==2.20.0

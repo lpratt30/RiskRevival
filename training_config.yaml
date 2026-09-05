@@ -1,4 +1,9 @@
-experiment_name: test_default6
+experiment_name: revival_baseline
+seed: 42
+overwrite: false
+save_plots: true
+live_monitoring: false  # Enable with --monitor or set true here
+monitor_interval_seconds: 2
 
 num_episodes: 2000
 max_actions: 2000
