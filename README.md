@@ -54,6 +54,63 @@ The monitoring entry point uses the same trainer and writes
 profile. W&B is used only when `--wandb-project YOUR_PROJECT` is supplied; it
 uses your configured account.
 
+## Live experiment monitoring
+
+After installing `requirements-monitoring.txt`, start training with live logs:
+
+```text
+python train.py --monitor
+```
+
+In a second terminal, open the local dashboard:
+
+```text
+python monitor.py --open
+```
+
+The dashboard listens at `http://127.0.0.1:6006` and scans `experiment_results`.
+On first use, open the **gear icon → Reload data** and set **Reload Period** to
+2 seconds. TensorBoard's browser refresh is separate from the server's file
+reload interval and may start disabled. Expand `train`, `evaluation`, `live`, or
+`hardware` to see their charts; use the run checkboxes to compare experiments.
+
+| Chart group | Contents | Horizontal step |
+| --- | --- | --- |
+| `train` | Reward, loss, epsilon, illegal/skip ratios, map ownership, results, replay size, optimizer steps, episode duration | Completed episode |
+| `evaluation` | Greedy evaluation rewards, results, action counts, illegal ratio | Evaluation episode |
+| `live` | Current episode/action, reward, recent loss, throughput, elapsed time, completed episodes | Heartbeat sample |
+| `hardware` | System CPU/RAM, process memory, available NVIDIA GPU utilization/memory/temperature | Heartbeat sample |
+| `run` (Text tab) | Configuration, current stage, completion/interruption/error status | Heartbeat sample |
+
+Use the dashboard's wall-time axis when comparing the heartbeat groups with
+episode groups. Missing hardware sensors are omitted, rather than shown as
+zero; CPU/RAM sampling requires psutil and NVIDIA readings require nvidia-smi.
+The NVIDIA query has a one-second timeout and runs in the background.
+
+Both trainers accept `--monitor`, `--no-monitor`, and
+`--monitor-interval 2`. The equivalent YAML options are `live_monitoring` and
+`monitor_interval_seconds`. Monitoring is opt-in and disabled runs do not load
+TensorBoard or create monitoring files. For custom outputs, start the dashboard
+with `python monitor.py --logdir PATH --port 6007`.
+
+Each invocation, including weight loading and evaluation-only runs, creates a
+separate `OUTPUT/monitoring/TIMESTAMP-ID` directory containing:
+
+- TensorBoard event files, periodically flushed while training is active.
+- `records.jsonl`, flushed after every training/evaluation episode.
+- `status.json`, an atomically replaced heartbeat with stage, progress, hardware,
+  timestamps, and `running`, `completed`, `failed`, or `interrupted` status.
+
+Closing the dashboard does not stop training. Ctrl+C in the trainer records
+`interrupted` and closes the logger; an abrupt process kill or power loss cannot
+write a final status, so a stale `updated_at` means the run may no longer be
+active. Completed logs remain viewable afterward. Turning monitoring on does
+not change action selection, rewards, replay, or optimization; hardware and
+disk activity can still affect elapsed-time measurements.
+
+TensorBoard integration uses PyTorch's
+[SummaryWriter API](https://docs.pytorch.org/docs/2.1/tensorboard.html).
+
 ## Game and agent
 
 - Maps: `size: 0` (4 territories), `1` (9), `2` (13), or `classic` (42).
@@ -106,6 +163,8 @@ env.close()
 | `train.py` | Configuration, training, evaluation, checkpoints, metrics |
 | `reporting.py` | Shared training plots |
 | `train_hardware_usage.py` | Optional monitoring/profiling around the trainer |
+| `monitoring.py` | Live TensorBoard records, background hardware sampling, durable status |
+| `monitor.py` | Local dashboard launcher for active and saved runs |
 | `test/` | Current unit and regression tests |
 | `debug_only/` | Historical experiments; see its README before use |
 

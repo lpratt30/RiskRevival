@@ -2,3 +2,4 @@
 psutil
 GPUtil
 wandb
+tensorboard==2.20.0

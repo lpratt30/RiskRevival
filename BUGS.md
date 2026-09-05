@@ -77,3 +77,19 @@ below combine that reproduced failure, source inspection, and regression tests.
 Smoke runs establish that the pipeline executes; they do not establish strategy
 quality or a performance improvement. GPU training and live W&B logging were
 not validated.
+
+## Live monitoring follow-up
+
+- Previously, metrics were only written after training completed, so neither
+  live inspection nor recovery of completed episode records was available.
+  Opt-in monitoring now flushes event/episode records during the run and writes
+  progress/hardware heartbeats independently of long training steps.
+- TensorBoard's browser-level **Reload data** setting starts disabled in the
+  validated installation. The dashboard launcher reloads event files every two
+  seconds; the README explains enabling browser refresh as well.
+- Errors and Ctrl+C preserve completed monitoring records and write a terminal
+  status. Forced process termination cannot do so; check heartbeat freshness.
+- Every invocation receives a unique monitoring directory, avoiding misleading
+  overlapping step histories after evaluation, weight loading, or overwrites.
+- NVIDIA hardware queries time out after one second; unavailable GPU sensors
+  are omitted. Both timeout behavior and multi-GPU parsing are covered by tests.

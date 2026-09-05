@@ -43,6 +43,8 @@ def main(
     config_path=DEFAULT_CONFIG,
     output_dir=None,
     wandb_project=None,
+    monitor=None,
+    monitor_interval=None,
 ):
     records = []
     run = None
@@ -66,6 +68,8 @@ def main(
             config_path=config_path,
             output_dir=output_dir,
             on_episode=on_episode,
+            monitor=monitor,
+            monitor_interval=monitor_interval,
         )
         (Path(result["output_dir"]) / "hardware_metrics.json").write_text(
             json.dumps(records, indent=2), encoding="utf-8"
@@ -82,6 +86,10 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--wandb-project")
     parser.add_argument("--profile", type=Path)
+    parser.add_argument(
+        "--monitor", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument("--monitor-interval", type=float)
     args = parser.parse_args()
     profiler = cProfile.Profile() if args.profile else None
     if profiler:
@@ -91,6 +99,8 @@ if __name__ == "__main__":
             config_path=args.config,
             output_dir=args.output_dir,
             wandb_project=args.wandb_project,
+            monitor=args.monitor,
+            monitor_interval=args.monitor_interval,
         )
     finally:
         if profiler:

@@ -12,6 +12,7 @@ import yaml
 
 from dqn import DQNAgent
 from env import RiskEnvFlat
+from monitoring import ExperimentMonitor
 from reporting import create_output_graphs
 
 DEFAULT_CONFIG = Path(__file__).with_name("training_config.yaml")
@@ -58,12 +59,21 @@ def episode_result(env):
     return "draw"
 
 
-def evaluate(agent, env, max_actions=500, num_eval=1, show_board=False):
+def evaluate(
+    agent,
+    env,
+    max_actions=500,
+    num_eval=1,
+    show_board=False,
+    *,
+    on_step=None,
+    on_evaluation=None,
+):
     """Greedy evaluation does not change the agent's exploration rate."""
     if max_actions < 1 or num_eval < 1:
         raise ValueError("Evaluation counts must be positive")
     results = []
-    for _ in range(num_eval):
+    for evaluation in range(1, num_eval + 1):
         state, _ = env.reset()
         total_reward = 0
         illegal_moves = 0
@@ -74,6 +84,13 @@ def evaluate(agent, env, max_actions=500, num_eval=1, show_board=False):
             state, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             illegal_moves += int(info["illegal_action"])
+            if on_step is not None:
+                on_step(
+                    evaluation=evaluation,
+                    actions=actions,
+                    reward=total_reward,
+                    illegal_move_ratio=illegal_moves / actions,
+                )
             if terminated or truncated:
                 break
         result = dict(
@@ -83,6 +100,8 @@ def evaluate(agent, env, max_actions=500, num_eval=1, show_board=False):
             result=episode_result(env),
         )
         results.append(result)
+        if on_evaluation is not None:
+            on_evaluation(evaluation, result)
         print(
             f"Evaluation reward: {total_reward:.3f}; illegal moves: "
             f"{result['illegal_move_ratio']:.3f}; result: {result['result']}"
@@ -100,11 +119,12 @@ def exploration_rate(config, episode):
     return float(np.clip(end + amplitude * abs(np.sin(phase)), end, start))
 
 
-def train_episode(agent, env, max_actions, optimize_ratio):
+def train_episode(agent, env, max_actions, optimize_ratio, *, on_step=None):
     state, _ = env.reset()
     counts = np.zeros(env.action_space.n, dtype=int)
     rewards, losses = [], []
     illegal_moves = 0
+    total_reward = 0.0
     started = time.perf_counter()
     for actions in range(1, max_actions + 1):
         action = agent.act(state)
@@ -114,12 +134,25 @@ def train_episode(agent, env, max_actions, optimize_ratio):
         agent.remember(state, action, reward, next_state, terminated, truncated)
         state = next_state
         rewards.append(reward)
+        total_reward += reward
         illegal_moves += int(info["illegal_action"])
         if actions % agent.batch_size == 0:
             for _ in range(optimize_ratio):
                 loss = agent.optimize_network()
                 if loss is not None:
                     losses.append(loss)
+        if on_step is not None:
+            on_step(
+                actions=actions,
+                reward=total_reward,
+                epsilon=agent.epsilon,
+                loss=losses[-1] if losses else None,
+                illegal_move_ratio=illegal_moves / actions,
+                map_owned=env.agent.territory_count / len(env.territories),
+                replay_size=len(agent.memory),
+                optimizer_steps=agent.steps,
+                actions_per_second=actions / max(time.perf_counter() - started, 1e-9),
+            )
         if terminated or truncated:
             break
     return {
@@ -147,11 +180,19 @@ def main(
     config_path=DEFAULT_CONFIG,
     output_dir=None,
     on_episode=None,
+    monitor=None,
+    monitor_interval=None,
 ):
     """Shared training entry point; env_name is retained for old callers."""
     if env_name != "RiskEnvFlat-v0":
         raise ValueError("Only RiskEnvFlat-v0 is supported")
     config = load_config(config_path)
+    if monitor is not None:
+        config["live_monitoring"] = monitor
+    if monitor_interval is not None:
+        config["monitor_interval_seconds"] = monitor_interval
+    if not isinstance(config.get("live_monitoring", False), bool):
+        raise ValueError("live_monitoring must be true or false")
     for key, value in (
         ("num_episodes", num_episodes),
         ("save_interval", save_interval),
@@ -203,80 +244,119 @@ def main(
             "or set overwrite: true explicitly"
         )
     checkpoint = checkpoints / config.get("load_checkpoint", "dqn_model_best.pth")
-    if load_model or eval_only:
-        agent.load(checkpoint)
+    live = ExperimentMonitor(
+        output,
+        config,
+        enabled=config.get("live_monitoring", False),
+        interval=config.get("monitor_interval_seconds", 2.0),
+    )
     records = []
     evaluations = []
     try:
-        if not eval_only:
-            checkpoints.mkdir(parents=True, exist_ok=True)
-            (output / "config.yaml").write_text(
-                yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
-            )
-            best_reward = -np.inf
-            for episode in range(config["num_episodes"]):
-                if config["decay_type"] != "geo":
-                    agent.epsilon = exploration_rate(config, episode)
-                record = train_episode(
-                    agent, env, config["max_actions"], config["optimize_ratio"]
-                )
-                records.append(record)
-                if (episode + 1) % config["save_interval"] == 0:
-                    agent.save(checkpoints / f"dqn_model_{episode}.pth")
-                if record["cumulative_reward"] > best_reward:
-                    best_reward = record["cumulative_reward"]
-                    agent.save(checkpoints / "dqn_model_best.pth")
-                print(
-                    f"Episode {episode + 1}/{config['num_episodes']}: "
-                    f"reward={record['cumulative_reward']:.2f}, loss={record['loss']:.5f}, "
-                    f"actions={record['actions']}, epsilon={agent.epsilon:.3f}"
-                )
-                if on_episode is not None:
-                    on_episode(episode + 1, record)
-            agent.save(checkpoints / "dqn_model_final.pth")
-            (output / "metrics.json").write_text(
-                json.dumps(records, indent=2), encoding="utf-8"
-            )
-            if config.get("save_plots", True):
-                keys = (
-                    "average_reward",
-                    "cumulative_reward",
-                    "loss",
-                    "illegal_move_ratio",
-                    "actions",
-                    "turns",
-                    "seconds",
-                    "action_std",
-                    "skip_ratio",
-                    "map_owned",
-                )
-                series = [[record[key] for record in records] for key in keys]
-                create_output_graphs(
-                    output,
-                    len(records),
-                    env.num_players,
-                    env.bot_types,
-                    env.board_size,
-                    series,
-                )
-        if eval_only or config.get("render_final_results", False):
-            if not eval_only:
+        with live:
+            if load_model or eval_only:
                 agent.load(checkpoint)
-            evaluations = evaluate(
-                agent,
-                env,
-                config["max_actions"],
-                config["num_eval"],
-                config.get("show_board", False),
-            )
-            (output / "evaluation.json").write_text(
-                json.dumps(evaluations, indent=2), encoding="utf-8"
-            )
-        return {
-            "output_dir": str(output),
-            "episodes": records,
-            "evaluation": evaluations,
-        }
+            if not eval_only:
+                checkpoints.mkdir(parents=True, exist_ok=True)
+                (output / "config.yaml").write_text(
+                    yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+                )
+                best_reward = -np.inf
+                for episode in range(config["num_episodes"]):
+                    live.update(
+                        stage="training",
+                        episode=episode + 1,
+                        actions=0,
+                        reward=0,
+                        loss=None,
+                    )
+                    if config["decay_type"] != "geo":
+                        agent.epsilon = exploration_rate(config, episode)
+                    record = train_episode(
+                        agent,
+                        env,
+                        config["max_actions"],
+                        config["optimize_ratio"],
+                        on_step=live.update if live.enabled else None,
+                    )
+                    record.update(
+                        epsilon=agent.epsilon,
+                        replay_size=len(agent.memory),
+                        optimizer_steps=agent.steps,
+                    )
+                    records.append(record)
+                    live.update(completed_episodes=episode + 1)
+                    live.record("train", episode + 1, record)
+                    if (episode + 1) % config["save_interval"] == 0:
+                        agent.save(checkpoints / f"dqn_model_{episode}.pth")
+                    if record["cumulative_reward"] > best_reward:
+                        best_reward = record["cumulative_reward"]
+                        agent.save(checkpoints / "dqn_model_best.pth")
+                    print(
+                        f"Episode {episode + 1}/{config['num_episodes']}: "
+                        f"reward={record['cumulative_reward']:.2f}, loss={record['loss']:.5f}, "
+                        f"actions={record['actions']}, epsilon={agent.epsilon:.3f}"
+                    )
+                    if on_episode is not None:
+                        on_episode(episode + 1, record)
+                agent.save(checkpoints / "dqn_model_final.pth")
+                (output / "metrics.json").write_text(
+                    json.dumps(records, indent=2), encoding="utf-8"
+                )
+                if config.get("save_plots", True):
+                    live.update(stage="plotting")
+                    keys = (
+                        "average_reward",
+                        "cumulative_reward",
+                        "loss",
+                        "illegal_move_ratio",
+                        "actions",
+                        "turns",
+                        "seconds",
+                        "action_std",
+                        "skip_ratio",
+                        "map_owned",
+                    )
+                    series = [[record[key] for record in records] for key in keys]
+                    create_output_graphs(
+                        output,
+                        len(records),
+                        env.num_players,
+                        env.bot_types,
+                        env.board_size,
+                        series,
+                    )
+            if eval_only or config.get("render_final_results", False):
+                live.update(
+                    stage="evaluation",
+                    actions=0,
+                    evaluation=0,
+                    epsilon=0,
+                    loss=None,
+                    total_evaluations=config["num_eval"],
+                )
+                if not eval_only:
+                    agent.load(checkpoint)
+                evaluations = evaluate(
+                    agent,
+                    env,
+                    config["max_actions"],
+                    config["num_eval"],
+                    config.get("show_board", False),
+                    on_step=live.update if live.enabled else None,
+                    on_evaluation=lambda step, record: live.record(
+                        "evaluation", step, record
+                    ),
+                )
+                (output / "evaluation.json").write_text(
+                    json.dumps(evaluations, indent=2), encoding="utf-8"
+                )
+            return {
+                "output_dir": str(output),
+                "episodes": records,
+                "evaluation": evaluations,
+                "monitor_dir": str(live.run_dir) if live.run_dir else None,
+            }
     finally:
         env.close()
 
@@ -286,9 +366,24 @@ def cli():
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--load-model", action="store_true")
+    parser.add_argument(
+        "--monitor",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Write live TensorBoard and status logs",
+    )
+    parser.add_argument(
+        "--monitor-interval",
+        type=float,
+        help="Seconds between live/hardware updates (default: 2)",
+    )
     args = parser.parse_args()
     main(
-        config_path=args.config, output_dir=args.output_dir, load_model=args.load_model
+        config_path=args.config,
+        output_dir=args.output_dir,
+        load_model=args.load_model,
+        monitor=args.monitor,
+        monitor_interval=args.monitor_interval,
     )
 
 
